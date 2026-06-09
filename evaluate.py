@@ -1,12 +1,18 @@
 from __future__ import annotations
 
+import argparse
+import json
 from typing import Dict, Iterable, List, Mapping, Tuple
 
 import numpy as np
 import torch
+import yaml
 from sklearn.metrics import accuracy_score, confusion_matrix, f1_score
+from torch.utils.data import DataLoader
+from transformers import AutoFeatureExtractor
 
-from dataset import CANONICAL_LABELS
+from dataset import CANONICAL_LABELS, SERDataCollator, load_iemocap_splits
+from model import SERModel
 
 
 @torch.no_grad()
@@ -56,3 +62,61 @@ def evaluate_model(model: torch.nn.Module, dataloader: Iterable[Mapping[str, tor
     metrics["loss"] = loss
     metrics["labels"] = CANONICAL_LABELS
     return metrics
+
+
+def resolve_device(name: str) -> torch.device:
+    if name != "auto":
+        return torch.device(name)
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Evaluate a trained SER checkpoint.")
+    parser.add_argument("--checkpoint", default="outputs/ser_baseline/best.pt")
+    parser.add_argument("--config", default=None)
+    parser.add_argument("--split", default="test", choices=["train", "validation", "test"])
+    parser.add_argument("--device", default="auto")
+    args = parser.parse_args()
+
+    device = resolve_device(args.device)
+    checkpoint = torch.load(args.checkpoint, map_location=device)
+    config = checkpoint.get("config")
+    if config is None:
+        if args.config is None:
+            raise ValueError("Checkpoint has no config. Pass --config explicitly.")
+        with open(args.config, "r", encoding="utf-8") as handle:
+            config = yaml.safe_load(handle)
+
+    datasets = load_iemocap_splits(config)
+    model_cfg = config["model"]
+    audio_cfg = config["audio"]
+    training_cfg = config["training"]
+    feature_extractor = AutoFeatureExtractor.from_pretrained(model_cfg["encoder_name"])
+    collator = SERDataCollator(feature_extractor, sampling_rate=int(audio_cfg.get("sampling_rate", 16000)))
+    dataloader = DataLoader(
+        datasets[args.split],
+        batch_size=int(training_cfg.get("eval_batch_size", 8)),
+        shuffle=False,
+        collate_fn=collator,
+        num_workers=int(training_cfg.get("num_workers", 0)),
+    )
+
+    model = SERModel(
+        encoder_name=model_cfg["encoder_name"],
+        num_labels=len(CANONICAL_LABELS),
+        pooling=model_cfg.get("pooling", "mean"),
+        freeze_encoder=False,
+        dropout=float(model_cfg.get("dropout", 0.2)),
+        hidden_dim=int(model_cfg.get("hidden_dim", 256)),
+    ).to(device)
+    model.load_state_dict(checkpoint["model_state_dict"])
+    metrics = evaluate_model(model, dataloader, device)
+    print(json.dumps(metrics, ensure_ascii=False, indent=2))
+
+
+if __name__ == "__main__":
+    main()
