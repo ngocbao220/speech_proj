@@ -47,6 +47,12 @@ Kiểm tra GPU:
 python -c "import torch; print(torch.__version__); print(torch.cuda.is_available()); print(torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'no cuda')"
 ```
 
+Kiểm tra import backbone:
+
+```bash
+python -c "from transformers import WavLMModel; print(WavLMModel.__name__)"
+```
+
 ## Train
 
 ```bash
